@@ -6,32 +6,35 @@ import base64, json
 client = OpenAI()
 app = FastAPI()
 
-# CORS để frontend GitHub Pages gọi được
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ======================
-#   TẦNG 1 — VISION
-# ======================
+
+# ============================
+#   HELPER: SAFE JSON PARSER
+# ============================
+def safe_json_loads(text):
+    """
+    Parses JSON safely.
+    Returns (success, data or error_message)
+    """
+    try:
+        return True, json.loads(text)
+    except Exception as e:
+        return False, f"JSON ERROR: {str(e)} | Raw: {text[:200]}"
+
+
+# ============================
+#   PROMPTS (3 tầng)
+# ============================
+
 VISION_PROMPT = """
-Bạn là chuyên gia điện tâm đồ. 
-Chỉ được mô tả điện tâm đồ từ ảnh ECG.
-
-Phải tìm:
-- ST chênh lên (mm, vị trí)
-- ST chênh xuống
-- Sóng T âm/bất đối xứng
-- Sóng Q bệnh lý
-- Reciprocal depression
-- Pattern nguy hiểm: De Winter, Wellens, Sgarbossa
-
-Không được chẩn đoán ACS.
-
-Trả đúng JSON:
+Bạn là chuyên gia điện tâm đồ. Hãy trả đúng JSON KHÔNG THÊM TỪ NÀO.
 
 {
   "st_elevation": {"co_khong":"", "vi_tri":"", "mien_do":""},
@@ -43,34 +46,19 @@ Trả đúng JSON:
   "ket_luan_ecg": ""
 }
 """
-# ======================
-#  TẦNG 2 — CLINICAL
-# ======================
-CLINICAL_PROMPT = """
-Bạn là bác sĩ tim mạch theo ESC 2023 / ACC 2024.
-Chỉ được phân tích TRIỆU CHỨNG + SINH HIỆU, KHÔNG sử dụng ECG.
 
-Trả đúng JSON:
+CLINICAL_PROMPT = """
+Phân tích triệu chứng + sinh hiệu theo ESC 2023.
+Chỉ trả JSON:
 
 {
   "phan_loai_lam_sang": "cao | trung_binh | thap",
   "giai_thich_lam_sang": ""
 }
 """
-# ======================
-#   TẦNG 3 — FUSION
-# ======================
+
 FUSION_PROMPT = """
-Bạn là bác sĩ tim mạch cấp cứu theo ESC 2023.
-Kết hợp vision_ecg + clinical.
-
-QUY TẮC FUSION:
-- Có ST chênh lên, pattern nguy hiểm → NGUY CƠ CAO
-- ECG không đặc hiệu + lâm sàng nghi ngờ → TRUNG BÌNH
-- ECG bình thường + lâm sàng thấp → THẤP
-- Thiếu thông tin → nâng mức nguy cơ
-
-Trả đúng JSON:
+Kết hợp vision + clinical, trả đúng JSON:
 
 {
   "muc_nguy_co": "",
@@ -79,9 +67,12 @@ Trả đúng JSON:
   "giai_thich": ""
 }
 """
-# ======================
-#  ENDPOINT CHÍNH
-# ======================
+
+
+# ============================
+#   BACKEND ENDPOINT
+# ============================
+
 @app.post("/api/analyze")
 async def analyze(
     age: int = Form(...),
@@ -98,12 +89,11 @@ async def analyze(
     ecg_file: UploadFile = File(...)
 ):
 
-    # ---- Đọc ảnh ECG ----
+    # ======================
+    # Tầng 1 — VISION
+    # ======================
     b64_image = base64.b64encode(await ecg_file.read()).decode()
 
-    # ==========================
-    #  CALL TẦNG 1 — VISION AI
-    # ==========================
     vision_response = client.chat.completions.create(
         model="gpt-4.1",
         messages=[
@@ -111,19 +101,27 @@ async def analyze(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Phân tích ECG."},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+                    {"type": "text", "text": "Phân tích hình ECG sau:"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
                 ]
             }
         ]
     )
 
-    vision_json = json.loads(vision_response.choices[0].message.content)
+    vision_raw = vision_response.choices[0].message.content
+    ok, vision_json = safe_json_loads(vision_raw)
 
-    # ==========================
-    #   CALL TẦNG 2 — CLINICAL
-    # ==========================
+    if not ok:
+        return {
+            "muc_nguy_co": "không_xác_định",
+            "chan_doan_goi_y": "AI không đọc được ECG",
+            "khuyen_cao": ["Chụp lại ảnh ECG rõ hơn", "Kiểm tra file ECG"],
+            "giai_thich": f"Lỗi Vision: {vision_json}"
+        }
+
+    # ======================
+    # Tầng 2 — CLINICAL
+    # ======================
     clinical_input = f"""
     Tuổi: {age}
     Giới: {sex}
@@ -145,15 +143,21 @@ async def analyze(
         ]
     )
 
-    clinical_json = json.loads(clinical_response.choices[0].message.content)
+    clinical_raw = clinical_response.choices[0].message.content
+    ok, clinical_json = safe_json_loads(clinical_raw)
 
-    # ==========================
-    #   CALL TẦNG 3 — FUSION
-    # ==========================
-    fusion_input = f"""
-    vision_ecg = {json.dumps(vision_json)}
-    clinical = {json.dumps(clinical_json)}
-    """
+    if not ok:
+        return {
+            "muc_nguy_co": "không_xác_định",
+            "chan_doan_gợi_y": "AI không xử lý được lâm sàng",
+            "khuyen_cao": ["Nhập triệu chứng lại", "Kiểm tra dữ liệu đầu vào"],
+            "giai_thich": f"Lỗi Clinical: {clinical_json}"
+        }
+
+    # ======================
+    # Tầng 3 — FUSION
+    # ======================
+    fusion_input = f"vision_ecg = {vision_json}\nclinical = {clinical_json}"
 
     fusion_response = client.chat.completions.create(
         model="gpt-4.1",
@@ -163,6 +167,15 @@ async def analyze(
         ]
     )
 
-    fusion_json = json.loads(fusion_response.choices[0].message.content)
+    fusion_raw = fusion_response.choices[0].message.content
+    ok, fusion_json = safe_json_loads(fusion_raw)
+
+    if not ok:
+        return {
+            "muc_nguy_co": "không_xác_định",
+            "chan_doan_goi_y": "AI không tổng hợp được dữ liệu",
+            "khuyen_cao": ["Thử lại sau vài giây"],
+            "giai_thich": f"Lỗi Fusion: {fusion_json}"
+        }
 
     return fusion_json
