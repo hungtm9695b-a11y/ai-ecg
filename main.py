@@ -1,9 +1,13 @@
-from fastapi import FastAPI, UploadFile, File, Form
+import uvicorn
+from fastapi import FastAPI, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import base64
+from io import BytesIO
 from openai import OpenAI
-import base64, json
 
 client = OpenAI()
+
 app = FastAPI()
 
 # CORS
@@ -15,81 +19,113 @@ app.add_middleware(
 )
 
 
-# ============================
-#   SAFE JSON LOADER
-# ============================
-def safe_json_loads(text):
-    try:
-        return True, json.loads(text)
-    except Exception as e:
-        return False, f"JSON ERROR: {str(e)} | RAW: {text[:200]}"
-
-
-# ============================
-#   PROMPTS
-# ============================
-
+# ============================================================
+# VISION PROMPT — Tối ưu cho ảnh ECG chụp giấy (loại 1)
+# ============================================================
 VISION_PROMPT = """
-Bạn là chuyên gia điện tâm đồ. Hãy trả đúng JSON KHÔNG THÊM TỪ NÀO.
+Bạn là chuyên gia tim mạch đọc ECG (ESC/ACC).
+
+Ảnh ECG có thể bị:
+- Nền đỏ do giấy
+- Méo nhẹ do chụp điện thoại
+- Bóng hoặc chói sáng
+- Gập nếp
+
+HÃY TẬP TRUNG vào:
+- ST elevation (mm và vị trí)
+- ST depression
+- T-wave: âm, đối xứng, cao nhọn
+- Q-wave (pathologic)
+- Reciprocal changes
+- Dấu hiệu nguy hiểm: Wellens, de Winter, STEMI equivalents
+
+Trả về JSON DUY NHẤT:
 
 {
-  "st_elevation": {"co_khong":"", "vi_tri":"", "mien_do":""},
-  "st_depression": "",
-  "t_wave": "",
-  "q_wave": "",
-  "reciprocal": "",
-  "pattern_nguy_hiem": [],
-  "ket_luan_ecg": ""
+  "st_elevation": { "co_khong": "...", "vi_tri": "..."},
+  "st_depression": "...",
+  "t_wave": "...",
+  "q_wave": "...",
+  "reciprocal": "...",
+  "pattern_nguy_hiem": ["..."],
+  "ket_luan_ecg": "..."
 }
 """
 
+
+# ============================================================
+# CLINICAL PROMPT (Triệu chứng + Risk + HEAR)
+# ============================================================
 CLINICAL_PROMPT = """
-Phân tích triệu chứng + sinh hiệu theo ESC 2023.
-Chỉ trả JSON:
+Bạn là bác sĩ tim mạch theo ESC 2023.
+
+Hãy phân tích dữ liệu:
+- Tuổi: {age}
+- Giới: {sex}
+- Huyết áp: {sbp}/{dbp}
+- Mạch: {hr}
+- SpO2: {spo2}
+
+Triệu chứng:
+{trieuchung}
+
+Yếu tố nguy cơ:
+{nguyco}
+
+HEAR score = {hear_score} (mức: {hear_level})
+HEAR CHỈ HỖ TRỢ, không quyết định thay ESC.
+
+Hãy phân loại:
+- Mức độ triệu chứng: điển hình / không điển hình / ít gợi ý
+- Đánh giá nguy cơ lâm sàng sơ bộ
+
+Trả về JSON:
 
 {
-  "phan_loai_lam_sang": "cao | trung_binh | thap",
-  "giai_thich_lam_sang": ""
+  "phan_loai_trieu_chung": "...",
+  "nguy_co_lam_sang": "cao/trung_binh/thap"
 }
 """
 
+
+# ============================================================
+# FUSION PROMPT — Ghép Clinical + ECG theo ESC 2023
+# ============================================================
 FUSION_PROMPT = """
-Bạn là bác sĩ tim mạch cấp cứu theo ESC 2023/ACC 2024.
-Dựa trên vision_ecg + clinical, hãy phân tầng nguy cơ.
+Bạn là chuyên gia cấp cứu & tim mạch theo ESC/ACC 2023.
 
-QUY TẮC:
-- Nguy cơ cao: có ST chênh lên, reciprocal depression, pattern nguy hiểm (De Winter, Wellens, Sgarbossa), hoặc lâm sàng rất nghi ngờ.
-- Nguy cơ trung bình: ECG không đặc hiệu + lâm sàng nghi ngờ.
-- Nguy cơ thấp: ECG bình thường + triệu chứng gợi ý thấp.
+Dữ liệu Clinical:
+{clinical_json}
 
-CHỈ TRẢ JSON và PHẢI dùng đúng 2 câu khuyến cáo theo từng mức nguy cơ.
+Dữ liệu ECG:
+{ecg_json}
 
-BỘ KHUYẾN CÁO CHUẨN:
+Nhiệm vụ:
+1) Phân loại mức NGUY CƠ CUỐI:
+   - cao  
+   - trung_binh  
+   - thap
 
-1) Nguy cơ CAO:
-- "Chuyển bệnh nhân đến cơ sở có khả năng can thiệp mạch vành khẩn cấp ngay lập tức."
-- "Duy trì monitoring liên tục và chuẩn bị xử trí rối loạn huyết động hoặc loạn nhịp nguy hiểm trong quá trình vận chuyển."
+2) Chẩn đoán gợi ý (ngắn gọn)
 
-2) Nguy cơ TRUNG BÌNH:
-- "Theo dõi sát triệu chứng và điện tâm đồ, đồng thời lặp lại ECG trong vòng 15–30 phút."
-- "Ưu tiên làm Troponin độ nhạy cao nếu có điều kiện, hoặc chuyển tuyến nếu triệu chứng tiến triển."
+3) Xuất đúng 2 câu khuyến cáo theo tiêu chuẩn ESC:
+   - Nếu "cao": chuyển tuyến ngay, chuẩn bị can thiệp.
+   - Nếu "trung_binh": theo dõi sát, làm troponin động học.
+   - Nếu "thap": ngoại trú, stress-test nếu cần.
 
-3) Nguy cơ THẤP:
-- "Hướng dẫn bệnh nhân theo dõi triệu chứng và tái khám ngay nếu đau ngực tái phát hoặc tăng lên."
-- "Cân nhắc làm xét nghiệm Troponin hoặc tham khảo ý kiến chuyên khoa nếu còn nghi ngờ lâm sàng."
+Trả về JSON DUY NHẤT:
 
-MẪU JSON BẮT BUỘC:
 {
-  "muc_nguy_co": "",
-  "chan_doan_goi_y": "",
-  "khuyen_cao": ["...", "..."],
-  "giai_thich": ""
+  "muc_nguy_co": "cao/trung_binh/thap",
+  "chan_doan_goi_y": "...",
+  "khuyen_cao": ["câu1", "câu2"]
 }
 """
-# ============================
-#   BACKEND ENDPOINT
-# ============================
 
+
+# ============================================================
+# API /analyze
+# ============================================================
 @app.post("/api/analyze")
 async def analyze(
     age: int = Form(...),
@@ -98,110 +134,113 @@ async def analyze(
     dbp: int = Form(...),
     hr: int = Form(...),
     spo2: int = Form(...),
-    symptom_main: str = Form(...),
-    duration: int = Form(...),
-    radiation: str = Form(...),
-    gt_nitrate: str = Form(...),
-    risk: str = Form(...),
+
+    hear_score: int = Form(...),
+    hear_level: str = Form(...),
+
+    sx: list[str] = Form(None),
+    risk: list[str] = Form(None),
+
     ecg_file: UploadFile = File(...)
 ):
+    try:
+        # ---------------------------------------------
+        # 1) Encode ECG image
+        # ---------------------------------------------
+        img_bytes = await ecg_file.read()
+        ecg_base64 = base64.b64encode(img_bytes).decode()
 
-    # ======================
-    # Tầng 1 — VISION
-    # ======================
-    b64_image = base64.b64encode(await ecg_file.read()).decode()
+        # ---------------------------------------------
+        # 2) Tầng VISION
+        # ---------------------------------------------
+        vision = client.responses.create(
+            model="gpt-4o-mini",
+            reasoning={"effort": "medium"},
+            input=[
+                {"role": "user", "content": VISION_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/jpeg;base64,{ecg_base64}"
+                        }
+                    ]
+                }
+            ]
+        )
 
-    vision_response = client.chat.completions.create(
-        model="gpt-4.1",
-        messages=[
-            {"role": "system", "content": VISION_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Phân tích ECG sau đây:"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
-                ]
+        vision_raw = vision.output_text
+        try:
+            import json
+            vision_json = json.loads(vision_raw)
+        except:
+            vision_json = {"ket_luan_ecg": "ECG không rõ, ảnh nhiễu"}
+
+        # ---------------------------------------------
+        # 3) Tầng CLINICAL
+        # ---------------------------------------------
+        trieuchung_text = ", ".join(sx) if sx else "Không có"
+        nguyco_text = ", ".join(risk) if risk else "Không có"
+
+        clinical_prompt_filled = CLINICAL_PROMPT.format(
+            age=age, sex=sex,
+            sbp=sbp, dbp=dbp,
+            hr=hr, spo2=spo2,
+            trieuchung=trieuchung_text,
+            nguyco=nguyco_text,
+            hear_score=hear_score,
+            hear_level=hear_level
+        )
+
+        clinical = client.responses.create(
+            model="gpt-4o-mini",
+            reasoning={"effort": "medium"},
+            input=clinical_prompt_filled
+        )
+
+        clinical_raw = clinical.output_text
+        try:
+            clinical_json = json.loads(clinical_raw)
+        except:
+            clinical_json = {
+                "phan_loai_trieu_chung": "khong_ro",
+                "nguy_co_lam_sang": "trung_binh"
             }
-        ]
-    )
 
-    raw_vision = vision_response.choices[0].message.content
-    ok, vision_json = safe_json_loads(raw_vision)
+        # ---------------------------------------------
+        # 4) Tầng FUSION
+        # ---------------------------------------------
+        fusion_prompt_filled = FUSION_PROMPT.format(
+            clinical_json=clinical_json,
+            ecg_json=vision_json
+        )
 
-    if not ok:
-        return {
-            "muc_nguy_co": "không_xác_định",
-            "chan_doan_goi_y": "AI không đọc được ECG.",
-            "khuyen_cao": [
-                "Chụp lại ảnh ECG rõ hơn.",
-                "Kiểm tra lại dây dẫn và chất lượng hình ảnh."
-            ],
-            "giai_thich": raw_vision
-        }
+        fusion = client.responses.create(
+            model="gpt-4o-mini",
+            reasoning={"effort": "medium"},
+            input=fusion_prompt_filled
+        )
 
-    # ======================
-    # Tầng 2 — CLINICAL
-    # ======================
-    clinical_input = f"""
-    Tuổi: {age}
-    Giới: {sex}
-    Huyết áp: {sbp}/{dbp}
-    Mạch: {hr}
-    SpO2: {spo2}
-    Triệu chứng: {symptom_main}
-    Thời gian đau: {duration}
-    Lan: {radiation}
-    Đáp ứng nitrate: {gt_nitrate}
-    Nguy cơ: {risk}
-    """
+        import json
+        fusion_json = json.loads(fusion.output_text)
 
-    clinical_response = client.chat.completions.create(
-        model="gpt-4.1",
-        messages=[
-            {"role": "system", "content": CLINICAL_PROMPT},
-            {"role": "user", "content": clinical_input}
-        ]
-    )
+        # ---------------------------------------------
+        # 5) TRẢ VỀ FULL JSON
+        # ---------------------------------------------
+        return JSONResponse({
+            "muc_nguy_co": fusion_json.get("muc_nguy_co", ""),
+            "chan_doan_goi_y": fusion_json.get("chan_doan_goi_y", ""),
+            "khuyen_cao": fusion_json.get("khuyen_cao", ["", ""]),
+            "ecg": vision_json
+        })
 
-    raw_clinical = clinical_response.choices[0].message.content
-    ok, clinical_json = safe_json_loads(raw_clinical)
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
 
-    if not ok:
-        return {
-            "muc_nguy_co": "không_xác_định",
-            "chan_doan_goi_y": "AI không xử lý được dữ liệu lâm sàng.",
-            "khuyen_cao": [
-                "Kiểm tra và nhập lại triệu chứng.",
-                "Cân nhắc chuyển tuyến nếu nghi ngờ cao."
-            ],
-            "giai_thich": raw_clinical
-        }
 
-    # ======================
-    # Tầng 3 — FUSION
-    # ======================
-    fusion_input = f"vision_ecg = {vision_json}\nclinical = {clinical_json}"
-
-    fusion_response = client.chat.completions.create(
-        model="gpt-4.1",
-        messages=[
-            {"role": "system", "content": FUSION_PROMPT},
-            {"role": "user", "content": fusion_input}
-        ]
-    )
-
-    raw_fusion = fusion_response.choices[0].message.content
-    ok, fusion_json = safe_json_loads(raw_fusion)
-
-    if not ok:
-        return {
-            "muc_nguy_co": "không_xác_định",
-            "chan_doan_goi_y": "AI không tổng hợp được kết quả.",
-            "khuyen_cao": [
-                "Theo dõi và lặp lại đánh giá.",
-                "Chuyển tuyến nếu triệu chứng không cải thiện."
-            ],
-            "giai_thich": raw_fusion
-        }
-
-    return fusion_json
+# ============================================================
+# RUN LOCAL
+# ============================================================
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=7860)
