@@ -16,21 +16,17 @@ app.add_middleware(
 
 
 # ============================
-#   HELPER: SAFE JSON PARSER
+#   SAFE JSON LOADER
 # ============================
 def safe_json_loads(text):
-    """
-    Parses JSON safely.
-    Returns (success, data or error_message)
-    """
     try:
         return True, json.loads(text)
     except Exception as e:
-        return False, f"JSON ERROR: {str(e)} | Raw: {text[:200]}"
+        return False, f"JSON ERROR: {str(e)} | RAW: {text[:200]}"
 
 
 # ============================
-#   PROMPTS (3 tầng)
+#   PROMPTS
 # ============================
 
 VISION_PROMPT = """
@@ -58,17 +54,38 @@ Chỉ trả JSON:
 """
 
 FUSION_PROMPT = """
-Kết hợp vision + clinical, trả đúng JSON:
+Bạn là bác sĩ tim mạch cấp cứu theo ESC 2023/ACC 2024.
+Dựa trên vision_ecg + clinical, hãy phân tầng nguy cơ.
 
+QUY TẮC:
+- Nguy cơ cao: có ST chênh lên, reciprocal depression, pattern nguy hiểm (De Winter, Wellens, Sgarbossa), hoặc lâm sàng rất nghi ngờ.
+- Nguy cơ trung bình: ECG không đặc hiệu + lâm sàng nghi ngờ.
+- Nguy cơ thấp: ECG bình thường + triệu chứng gợi ý thấp.
+
+CHỈ TRẢ JSON và PHẢI dùng đúng 2 câu khuyến cáo theo từng mức nguy cơ.
+
+BỘ KHUYẾN CÁO CHUẨN:
+
+1) Nguy cơ CAO:
+- "Chuyển bệnh nhân đến cơ sở có khả năng can thiệp mạch vành khẩn cấp ngay lập tức."
+- "Duy trì monitoring liên tục và chuẩn bị xử trí rối loạn huyết động hoặc loạn nhịp nguy hiểm trong quá trình vận chuyển."
+
+2) Nguy cơ TRUNG BÌNH:
+- "Theo dõi sát triệu chứng và điện tâm đồ, đồng thời lặp lại ECG trong vòng 15–30 phút."
+- "Ưu tiên làm Troponin độ nhạy cao nếu có điều kiện, hoặc chuyển tuyến nếu triệu chứng tiến triển."
+
+3) Nguy cơ THẤP:
+- "Hướng dẫn bệnh nhân theo dõi triệu chứng và tái khám ngay nếu đau ngực tái phát hoặc tăng lên."
+- "Cân nhắc làm xét nghiệm Troponin hoặc tham khảo ý kiến chuyên khoa nếu còn nghi ngờ lâm sàng."
+
+MẪU JSON BẮT BUỘC:
 {
   "muc_nguy_co": "",
   "chan_doan_goi_y": "",
-  "khuyen_cao": [],
+  "khuyen_cao": ["...", "..."],
   "giai_thich": ""
 }
 """
-
-
 # ============================
 #   BACKEND ENDPOINT
 # ============================
@@ -101,22 +118,25 @@ async def analyze(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Phân tích hình ECG sau:"},
+                    {"type": "text", "text": "Phân tích ECG sau đây:"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
                 ]
             }
         ]
     )
 
-    vision_raw = vision_response.choices[0].message.content
-    ok, vision_json = safe_json_loads(vision_raw)
+    raw_vision = vision_response.choices[0].message.content
+    ok, vision_json = safe_json_loads(raw_vision)
 
     if not ok:
         return {
             "muc_nguy_co": "không_xác_định",
-            "chan_doan_goi_y": "AI không đọc được ECG",
-            "khuyen_cao": ["Chụp lại ảnh ECG rõ hơn", "Kiểm tra file ECG"],
-            "giai_thich": f"Lỗi Vision: {vision_json}"
+            "chan_doan_goi_y": "AI không đọc được ECG.",
+            "khuyen_cao": [
+                "Chụp lại ảnh ECG rõ hơn.",
+                "Kiểm tra lại dây dẫn và chất lượng hình ảnh."
+            ],
+            "giai_thich": raw_vision
         }
 
     # ======================
@@ -143,15 +163,18 @@ async def analyze(
         ]
     )
 
-    clinical_raw = clinical_response.choices[0].message.content
-    ok, clinical_json = safe_json_loads(clinical_raw)
+    raw_clinical = clinical_response.choices[0].message.content
+    ok, clinical_json = safe_json_loads(raw_clinical)
 
     if not ok:
         return {
             "muc_nguy_co": "không_xác_định",
-            "chan_doan_gợi_y": "AI không xử lý được lâm sàng",
-            "khuyen_cao": ["Nhập triệu chứng lại", "Kiểm tra dữ liệu đầu vào"],
-            "giai_thich": f"Lỗi Clinical: {clinical_json}"
+            "chan_doan_goi_y": "AI không xử lý được dữ liệu lâm sàng.",
+            "khuyen_cao": [
+                "Kiểm tra và nhập lại triệu chứng.",
+                "Cân nhắc chuyển tuyến nếu nghi ngờ cao."
+            ],
+            "giai_thich": raw_clinical
         }
 
     # ======================
@@ -167,15 +190,18 @@ async def analyze(
         ]
     )
 
-    fusion_raw = fusion_response.choices[0].message.content
-    ok, fusion_json = safe_json_loads(fusion_raw)
+    raw_fusion = fusion_response.choices[0].message.content
+    ok, fusion_json = safe_json_loads(raw_fusion)
 
     if not ok:
         return {
             "muc_nguy_co": "không_xác_định",
-            "chan_doan_goi_y": "AI không tổng hợp được dữ liệu",
-            "khuyen_cao": ["Thử lại sau vài giây"],
-            "giai_thich": f"Lỗi Fusion: {fusion_json}"
+            "chan_doan_goi_y": "AI không tổng hợp được kết quả.",
+            "khuyen_cao": [
+                "Theo dõi và lặp lại đánh giá.",
+                "Chuyển tuyến nếu triệu chứng không cải thiện."
+            ],
+            "giai_thich": raw_fusion
         }
 
     return fusion_json
